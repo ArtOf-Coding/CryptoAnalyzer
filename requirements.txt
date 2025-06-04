@@ -1,0 +1,17 @@
+bidict==0.23.1
+certifi==2025.4.26
+cffi==1.17.1
+charset-normalizer==2.0.12
+cryptography==40.0.2
+h11==0.16.0
+idna==3.10
+pycparser==2.22
+python-dotenv==1.1.0
+python-engineio==4.12.1
+python-socketio==5.5.1
+requests==2.27.1
+schedule==1.2.2
+simple-websocket==1.1.0
+urllib3==1.26.20
+websocket-client==1.2.3
+wsproto==1.2.0
