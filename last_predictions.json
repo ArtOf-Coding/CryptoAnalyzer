@@ -1,0 +1,42 @@
+{
+  "BTC": {
+    "action": "HOLD",
+    "price": 7584205.0,
+    "ts": "2026-05-17 15:49 UTC"
+  },
+  "ETH": {
+    "action": "HOLD",
+    "price": 213286.0,
+    "ts": "2026-05-17 15:49 UTC"
+  },
+  "BNB": {
+    "action": "HOLD",
+    "price": 63198.49,
+    "ts": "2026-05-17 15:49 UTC"
+  },
+  "SOL": {
+    "action": "HOLD",
+    "price": 8442.0,
+    "ts": "2026-05-17 15:49 UTC"
+  },
+  "XRP": {
+    "action": "HOLD",
+    "price": 138.1,
+    "ts": "2026-05-17 15:49 UTC"
+  },
+  "DOGE": {
+    "action": "HOLD",
+    "price": 10.8767,
+    "ts": "2026-05-17 15:49 UTC"
+  },
+  "ADA": {
+    "action": "HOLD",
+    "price": 25.134,
+    "ts": "2026-05-17 15:49 UTC"
+  },
+  "AVAX": {
+    "action": "HOLD",
+    "price": 904.48,
+    "ts": "2026-05-17 15:49 UTC"
+  }
+}

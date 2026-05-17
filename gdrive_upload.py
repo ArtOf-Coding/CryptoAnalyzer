@@ -1,49 +1,69 @@
 """
-Google Drive uploader – uploads/updates trade_tracker.xlsx in a
-designated Drive folder using a Service Account (no OAuth flow needed).
+Google Drive uploader using OAuth2 (personal Google account).
+Works with regular Google Drive — no Shared Drive needed.
 
-Setup (one-time, free):
-  1. Go to https://console.cloud.google.com/
-  2. Create a project → Enable "Google Drive API"
-  3. IAM & Admin → Service Accounts → Create → Download JSON key
-  4. Share your target Drive folder with the service account email
-  5. Store the JSON key content as the GitHub secret GDRIVE_SERVICE_ACCOUNT_JSON
-  6. Optionally set GDRIVE_FOLDER_ID to a specific folder ID (defaults to root)
+First run: opens browser to authenticate and saves token.json
+Subsequent runs: uses saved token automatically (no browser needed).
 """
 
-import io
 import json
 import logging
 import os
-import time
 from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-# ── Lazy-import: only needed at upload time ──────────────────────────────────
-def _get_drive_service():
-    """Build and return an authenticated Google Drive service object."""
-    try:
-        from google.oauth2 import service_account
-        from googleapiclient.discovery import build
-    except ImportError:
-        raise ImportError(
-            "google-api-python-client and google-auth are required.\n"
-            "Run: pip install google-api-python-client google-auth"
-        )
+OAUTH_CREDS_FILE = Path("oauth_credentials.json")
+TOKEN_FILE       = Path("token.json")
+SCOPES           = ["https://www.googleapis.com/auth/drive.file"]
 
-    creds_json = os.environ.get("GDRIVE_SERVICE_ACCOUNT_JSON", "")
-    if not creds_json:
-        raise ValueError("GDRIVE_SERVICE_ACCOUNT_JSON env var is not set.")
 
-    info = json.loads(creds_json)
-    scopes = ["https://www.googleapis.com/auth/drive.file"]
-    creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
+def _get_oauth_service():
+    from google.oauth2.credentials import Credentials
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    from google.auth.transport.requests import Request
+    from googleapiclient.discovery import build
+
+    creds = None
+
+    # Load saved token if exists
+    if TOKEN_FILE.exists():
+        creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
+
+    # If no valid token, authenticate
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            # Check if running in GitHub Actions (no browser)
+            if os.environ.get("GITHUB_ACTIONS"):
+                # Load token from environment variable
+                token_json = os.environ.get("GDRIVE_OAUTH_TOKEN", "")
+                if not token_json:
+                    raise ValueError(
+                        "GDRIVE_OAUTH_TOKEN secret not set in GitHub Actions. "
+                        "Run locally first to generate token.json, then add its "
+                        "contents as the GDRIVE_OAUTH_TOKEN secret."
+                    )
+                creds = Credentials.from_authorized_user_info(
+                    json.loads(token_json), SCOPES
+                )
+            else:
+                # Local: open browser for one-time auth
+                flow = InstalledAppFlow.from_client_secrets_file(
+                    str(OAUTH_CREDS_FILE), SCOPES
+                )
+                creds = flow.run_local_server(port=0)
+
+        # Save token for future runs
+        with open(TOKEN_FILE, "w") as f:
+            f.write(creds.to_json())
+        log.info(f"Token saved to {TOKEN_FILE}")
+
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
-def _find_existing_file(service, filename: str, folder_id: str | None) -> str | None:
-    """Return the Drive file ID if a file with this name already exists in the folder."""
+def _find_existing_file(service, filename: str, folder_id: str) -> str | None:
     query = f"name = '{filename}' and trashed = false"
     if folder_id:
         query += f" and '{folder_id}' in parents"
@@ -53,15 +73,10 @@ def _find_existing_file(service, filename: str, folder_id: str | None) -> str | 
 
 
 def upload_to_drive(local_path: Path, drive_filename: str = "trade_tracker.xlsx") -> str:
-    """
-    Upload or update the Excel file on Google Drive.
-    Returns the public (or shareable) URL of the file.
-    """
-    folder_id = os.environ.get("GDRIVE_FOLDER_ID", "")  # optional; root if empty
+    folder_id = os.environ.get("GDRIVE_FOLDER_ID", "")
 
     try:
-        service = _get_drive_service()
-
+        service = _get_oauth_service()
         from googleapiclient.http import MediaFileUpload
 
         mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -70,15 +85,13 @@ def upload_to_drive(local_path: Path, drive_filename: str = "trade_tracker.xlsx"
         existing_id = _find_existing_file(service, drive_filename, folder_id or None)
 
         if existing_id:
-            # Update existing file (keeps same ID and sharing settings)
             file = (
                 service.files()
                 .update(fileId=existing_id, media_body=media, fields="id, webViewLink")
                 .execute()
             )
-            log.info(f"Google Drive: updated existing file (id={existing_id})")
+            log.info(f"Google Drive: updated (id={existing_id})")
         else:
-            # Create new file
             metadata = {"name": drive_filename}
             if folder_id:
                 metadata["parents"] = [folder_id]
@@ -87,7 +100,7 @@ def upload_to_drive(local_path: Path, drive_filename: str = "trade_tracker.xlsx"
                 .create(body=metadata, media_body=media, fields="id, webViewLink")
                 .execute()
             )
-            log.info(f"Google Drive: created new file (id={file['id']})")
+            log.info(f"Google Drive: created (id={file['id']})")
 
         url = file.get("webViewLink", f"https://drive.google.com/file/d/{file['id']}/view")
         log.info(f"Google Drive URL: {url}")

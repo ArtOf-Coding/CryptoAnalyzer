@@ -18,7 +18,9 @@ from gdrive_upload import upload_to_drive
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+from dotenv import load_dotenv
 
+load_dotenv()
 # ─────────────── CONFIG ──────────────────────────────────────────────────────
 COINSWITCH_API_KEY    = os.environ.get("COINSWITCH_API_KEY", "")
 COINSWITCH_SECRET_KEY = os.environ.get("COINSWITCH_SECRET_KEY", "")
@@ -32,14 +34,20 @@ EXCEL_FILE  = Path("trade_tracker.xlsx")
 LOG_FILE    = Path("logs/trader.log")
 STATE_FILE  = Path("last_predictions.json")
 
+# HuggingFace Models
+HF_MODEL      = "mrm8488/distilroberta-finetuned-financial-news-sentiment-analysis"
+FINBERT_MODEL = "yiyanghkust/finbert-tone"
+FINBERT_URL = f"https://router.huggingface.co/hf-inference/models/{FINBERT_MODEL}"
+HF_API_URL  = f"https://router.huggingface.co/hf-inference/models/{HF_MODEL}"
+
 # CoinSwitch base URL
 CS_BASE = "https://coinswitch.co/trade/api/v2"
 
 # HuggingFace Inference API – CryptoGemma-4B
 # Using: google/gemma-3-1b-it (free) or NousResearch/CryptoGemma-4B if published
 # Falls back to gemma-2-2b-it which is freely available
-HF_MODEL   = "google/gemma-2-2b-it"   # Change to CryptoGemma-4B when available on HF Hub
-HF_API_URL = f"https://api-inference.huggingface.co/models/{HF_MODEL}"
+#HF_MODEL   = "google/gemma-2-2b-it"   # Change to CryptoGemma-4B when available on HF Hub
+#HF_API_URL = f"https://api-inference.huggingface.co/models/{HF_MODEL}"
 
 # ─────────────── LOGGING ─────────────────────────────────────────────────────
 LOG_FILE.parent.mkdir(exist_ok=True)
@@ -53,26 +61,132 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# ═══════════════════════════════════════════════════════════════════
+#  1.  COINSWITCH API  (corrected endpoints + new signature format)
+# ═══════════════════════════════════════════════════════════════════
+def _cs_signature(method: str, endpoint: str, epoch: str, params: dict = {}, payload: dict = {}) -> str:
+    """Build signature including query params for GET requests."""
+    
+    if method == "GET" and params:
+        # Sort params and append to endpoint like: /endpoint?a=1&b=2
+        query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+        sign_endpoint = f"{endpoint}?{query}"
+    else:
+        sign_endpoint = endpoint
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  1.  COINSWITCH API
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _cs_headers(method: str, endpoint: str, payload: dict) -> dict:
-    """Generate CoinSwitch HMAC-signed headers."""
-    ts = str(int(time.time() * 1000))
     payload_str = json.dumps(payload, separators=(",", ":"), sort_keys=True) if payload else ""
-    sign_str = f"{method}{endpoint}{ts}{payload_str}"
-    signature = hmac.new(
-        COINSWITCH_SECRET_KEY.encode(), sign_str.encode(), hashlib.sha256
+    sign_str = method + sign_endpoint + epoch + payload_str
+
+    return hmac.new(
+        COINSWITCH_SECRET_KEY.encode(),
+        sign_str.encode(),
+        hashlib.sha256
     ).hexdigest()
+
+
+def _cs_headers_with_params(method: str, endpoint: str, params: dict = {}, payload: dict = {}) -> dict:
+    epoch = str(int(time.time() * 1000))
+    signature = _cs_signature(method, endpoint, epoch, params, payload)
     return {
-        "Content-Type": "application/json",
-        "X-AUTH-APIKEY": COINSWITCH_API_KEY,
+        "Content-Type":     "application/json",
+        "X-AUTH-APIKEY":    COINSWITCH_API_KEY,
         "X-AUTH-SIGNATURE": signature,
-        "X-AUTH-TIMESTAMP": ts,
+        "X-AUTH-EPOCH":     epoch,
     }
 
+
+def _fetch_prices_coinswitch() -> dict[str, float]:
+    prices = {c: 0.0 for c in COINS}
+    endpoint = "/trade/api/v2/24hr/all-pairs/ticker"
+    params   = {"exchange": "coinswitchx"}
+    try:
+        headers = _cs_headers_with_params("GET", endpoint, params=params)
+        resp = requests.get(
+            "https://coinswitch.co" + endpoint,
+            headers=headers,
+            params=params,
+            timeout=15
+        )
+        resp.raise_for_status()
+        raw  = resp.json()
+        log.info(f"CoinSwitch raw: {str(raw)[:300]}")
+        data = raw.get("data", {})
+
+        if isinstance(data, dict):
+            for symbol, item in data.items():
+                if isinstance(item, dict) and "/INR" in symbol:
+                    coin = symbol.split("/")[0].upper()
+                    if coin in COINS:
+                        prices[coin] = float(item.get("lastPrice", 0))
+        elif isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    symbol = item.get("symbol", "")
+                    if "/INR" in symbol:
+                        coin = symbol.split("/")[0].upper()
+                        if coin in COINS:
+                            prices[coin] = float(item.get("lastPrice", 0))
+
+        log.info(f"CoinSwitch prices: {prices}")
+    except Exception as e:
+        log.error(f"CoinSwitch fetch failed: {e}")
+        try:
+            log.error(f"Response body: {resp.text[:500]}")
+        except Exception:
+            pass
+        prices = _fetch_prices_coingecko()
+    return prices
+
+def fetch_24h_stats_coinswitch() -> dict[str, dict]:
+    stats = {c: {"change_24h": 0.0, "volume_24h": 0.0} for c in COINS}
+    endpoint = "/trade/api/v2/24hr/all-pairs/ticker"
+    params   = {"exchange": "coinswitchx"}
+    try:
+        headers = _cs_headers_with_params("GET", endpoint, params=params)
+        resp = requests.get(
+            "https://coinswitch.co" + endpoint,
+            headers=headers,
+            params=params,
+            timeout=15
+        )
+        resp.raise_for_status()
+        raw  = resp.json()
+        #log.info(f"CoinSwitch raw stats: {str(raw)[:1000]}")  # ← add this line
+        data = raw.get("data", {})
+
+        if isinstance(data, dict):
+            for symbol, item in data.items():
+                if isinstance(item, dict) and "/INR" in symbol:
+                    coin = symbol.split("/")[0].upper()
+                if coin in COINS:
+                    stats[coin] = {
+                        "change_24h": round(float(item.get("percentageChange", 0.0)), 2),
+                        "volume_24h": round(float(item.get("baseVolume", 0.0)), 2),
+                    }
+        elif isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    symbol = item.get("symbol", "")
+                    if "/INR" in symbol:
+                        coin = symbol.split("/")[0].upper()
+                        if coin in COINS:
+                            stats[coin] = {
+                                "change_24h": round(float(item.get("percentageChange", 0.0)), 2),
+                                "volume_24h": round(float(item.get("baseVolume", 0.0)), 2),
+                            }
+
+        log.info(f"CoinSwitch 24h stats: {stats}")
+
+    except Exception as e:
+        log.warning(f"CoinSwitch 24h stats failed: {e}")
+        try:
+            log.warning(f"Response body: {resp.text[:500]}")
+        except Exception:
+            pass
+        # Fallback to CoinGecko
+        stats = fetch_24h_stats()
+
+    return stats
 
 def fetch_prices() -> dict[str, float]:
     """
@@ -83,25 +197,6 @@ def fetch_prices() -> dict[str, float]:
         return _fetch_prices_coinswitch()
     log.warning("No CoinSwitch credentials – using CoinGecko fallback")
     return _fetch_prices_coingecko()
-
-
-def _fetch_prices_coinswitch() -> dict[str, float]:
-    prices = {}
-    endpoint = "/coins/INR"
-    try:
-        headers = _cs_headers("GET", endpoint, {})
-        resp = requests.get(CS_BASE + endpoint, headers=headers, timeout=15)
-        resp.raise_for_status()
-        data = resp.json().get("data", [])
-        sym_map = {item["symbol"].upper(): float(item["price"]) for item in data}
-        for coin in COINS:
-            prices[coin] = sym_map.get(coin, 0.0)
-        log.info(f"CoinSwitch prices fetched: {prices}")
-    except Exception as e:
-        log.error(f"CoinSwitch fetch failed: {e}")
-        prices = _fetch_prices_coingecko()
-    return prices
-
 
 _GECKO_IDS = {
     "BTC": "bitcoin", "ETH": "ethereum", "BNB": "binancecoin",
@@ -207,50 +302,113 @@ def build_prompt(prices: dict, stats: dict, prev_preds: dict) -> str:
     lines.append("\nRespond with only the JSON object. No explanation.")
     return "\n".join(lines)
 
+def get_sentiment_scores(prices: dict, stats: dict) -> dict[str, str]:
+    """Use FinBERT to score market sentiment per coin."""
+    sentiments = {}
+    if not HF_API_TOKEN:
+        return {c: "neutral" for c in COINS}
+
+    headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
+    for coin in COINS:
+        ch = stats[coin]["change_24h"]
+        vol = stats[coin]["volume_24h"]
+        text = (
+            f"{coin} price changed {ch:+.2f}% in 24 hours "
+            f"with trading volume of {vol:,.0f} INR. "
+            f"Current price is {prices[coin]:,.2f} INR."
+        )
+        try:
+            resp = requests.post(
+                FINBERT_URL,
+                headers=headers,
+                json={"inputs": text},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            results = resp.json()
+            if isinstance(results, list) and results:
+                # FinBERT returns list of [{label, score}]
+                scores = results[0] if isinstance(results[0], list) else results
+                best = max(scores, key=lambda x: x["score"])
+                sentiments[coin] = best["label"].lower()  # positive/negative/neutral
+            else:
+                sentiments[coin] = "neutral"
+        except Exception as e:
+            log.warning(f"FinBERT failed for {coin}: {e}")
+            sentiments[coin] = "neutral"
+
+    log.info(f"FinBERT sentiments: {sentiments}")
+    return sentiments
+
 
 def get_ai_decisions(prices: dict, stats: dict, prev_preds: dict) -> dict[str, str]:
-    prompt = build_prompt(prices, stats, prev_preds)
-    decisions = {c: "HOLD" for c in COINS}  # safe default
+    """Combine FinBERT sentiment + Finance-LLM for final BUY/SELL/HOLD."""
+    
+    # Step 1: Get sentiment from FinBERT
+    sentiments = get_sentiment_scores(prices, stats)
+
+    # Step 2: Build enriched prompt with sentiment for Finance-LLM
+    decisions = {c: "HOLD" for c in COINS}
 
     if not HF_API_TOKEN:
         log.warning("No HF_API_TOKEN – using rule-based fallback")
         return _rule_based_decisions(stats)
+
+    lines = [
+        "You are an expert crypto trading analyst. "
+        "Based on the data below, respond ONLY with a JSON object "
+        "like: {\"BTC\": \"BUY\", \"ETH\": \"HOLD\", ...}\n"
+        "Use only BUY, SELL, or HOLD.\n"
+    ]
+    for coin in COINS:
+        prev = prev_preds.get(coin, {})
+        lines.append(
+            f"{coin}: price=₹{prices[coin]:,.2f} | "
+            f"24h_change={stats[coin]['change_24h']:+.2f}% | "
+            f"volume=₹{stats[coin]['volume_24h']:,.0f} | "
+            f"sentiment={sentiments[coin]} | "
+            f"last_action={prev.get('action','N/A')} | "
+            f"last_price=₹{prev.get('price', 0):,.2f}"
+        )
+    lines.append("\nJSON response only:")
+    prompt = "\n".join(lines)
 
     headers = {"Authorization": f"Bearer {HF_API_TOKEN}", "Content-Type": "application/json"}
     payload = {
         "inputs": prompt,
         "parameters": {
             "max_new_tokens": 200,
-            "temperature": 0.3,
-            "do_sample": True,
+            "temperature": 0.2,
             "return_full_text": False,
         },
     }
+
     try:
-        resp = requests.post(HF_API_URL, headers=headers, json=payload, timeout=60)
+        hf_url = f"https://api-inference.huggingface.co/models/{HF_MODEL}"
+        resp = requests.post(hf_url, headers=headers, json=payload, timeout=60)
         if resp.status_code == 503:
-            log.warning("HF model loading – retrying in 20s")
+            log.warning("Model loading – retrying in 20s")
             time.sleep(20)
-            resp = requests.post(HF_API_URL, headers=headers, json=payload, timeout=60)
+            resp = requests.post(hf_url, headers=headers, json=payload, timeout=60)
         resp.raise_for_status()
         raw = resp.json()
         text = raw[0]["generated_text"] if isinstance(raw, list) else raw.get("generated_text", "")
-        # Extract JSON block
-        start = text.find("{")
-        end   = text.rfind("}") + 1
+        start, end = text.find("{"), text.rfind("}") + 1
         if start != -1 and end > start:
             parsed = json.loads(text[start:end])
             for coin in COINS:
                 action = str(parsed.get(coin, "HOLD")).upper()
                 decisions[coin] = action if action in ("BUY", "SELL", "HOLD") else "HOLD"
-        log.info(f"AI decisions: {decisions}")
+        log.info(f"Finance-LLM decisions: {decisions}")
     except Exception as e:
-        log.error(f"HF API error: {e} – using rule-based fallback")
-        decisions = _rule_based_decisions(stats)
+        log.error(f"Finance-LLM error: {e} – using sentiment-based fallback")
+        # Fallback: derive decision purely from FinBERT sentiment
+        for coin in COINS:
+            s = sentiments[coin]
+            decisions[coin] = "BUY" if s == "positive" else "SELL" if s == "negative" else "HOLD"
 
     return decisions
-
-
+    
 def _rule_based_decisions(stats: dict) -> dict[str, str]:
     """Simple momentum rule: buy on strong up, sell on strong down, else hold."""
     decisions = {}
@@ -433,7 +591,7 @@ def run():
 
     # Step 1: Fetch market data
     prices = fetch_prices()
-    stats  = fetch_24h_stats()
+    stats = fetch_24h_stats_coinswitch() if (COINSWITCH_API_KEY and COINSWITCH_SECRET_KEY) else fetch_24h_stats()
 
     # Step 2: Load previous predictions
     prev_preds = load_prev_predictions()
@@ -471,16 +629,16 @@ def run():
     save_predictions(new_preds)
 
     # Step 6: Upload to Google Drive (if credentials present)
-    if GDRIVE_ENABLED:
-        log.info("Uploading to Google Drive...")
-        url = upload_to_drive(EXCEL_FILE)
-        if url:
-            log.info(f"✅  Google Drive: {url}")
-        else:
-            log.warning("Google Drive upload failed – file kept locally.")
-    else:
-        log.info("GDRIVE_SERVICE_ACCOUNT_JSON not set – skipping Drive upload.")
-
+    #if GDRIVE_ENABLED:
+    #    log.info("Uploading to Google Drive...")
+    #    url = upload_to_drive(EXCEL_FILE)
+    #    if url:
+    #        log.info(f"✅  Google Drive: {url}")
+    #    else:
+    #        log.warning("Google Drive upload failed – file kept locally.")
+    #else:
+    #    log.info("GDRIVE_SERVICE_ACCOUNT_JSON not set – skipping Drive upload.")
+#
     log.info("Run complete. Excel updated.")
     log.info("=" * 60)
 
