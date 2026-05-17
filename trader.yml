@@ -1,0 +1,53 @@
+name: Crypto AI Trader – Every 30 Minutes
+
+on:
+  schedule:
+    - cron: "0,30 * * * *"
+  workflow_dispatch:
+
+jobs:
+  trade-analysis:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Restore persisted Excel + state JSON from previous run
+      - name: Restore trade data cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            trade_tracker.xlsx
+            last_predictions.json
+          key: trade-data-${{ github.run_id }}
+          restore-keys: |
+            trade-data-
+
+      - name: Run crypto trader
+        env:
+          COINSWITCH_API_KEY:             ${{ secrets.COINSWITCH_API_KEY }}
+          COINSWITCH_SECRET_KEY:          ${{ secrets.COINSWITCH_SECRET_KEY }}
+          HF_API_TOKEN:                   ${{ secrets.HF_API_TOKEN }}
+          GDRIVE_SERVICE_ACCOUNT_JSON:    ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+          GDRIVE_FOLDER_ID:               ${{ secrets.GDRIVE_FOLDER_ID }}
+        run: python main.py
+
+      # Always keep a downloadable copy in GitHub too (backup)
+      - name: Upload Excel as GitHub artifact (backup)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trade-log-${{ github.run_number }}
+          path: trade_tracker.xlsx
+          retention-days: 30
